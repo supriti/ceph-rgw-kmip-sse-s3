@@ -1,0 +1,18 @@
+# PyKMIP server for testing RGW KMIP (SSE-KMS / SSE-S3).
+# Generate certs first: ./gen_certs.sh
+# Then: docker compose up -d
+# RGW on host: rgw_crypt_kmip_addr = 127.0.0.1:5696
+# RGW in Docker: use host.docker.internal:5696 or service name pykmip:5696 if same compose.
+
+services:
+  pykmip:
+    build: .
+    container_name: pykmip
+    ports:
+      - "5696:5696"
+    volumes:
+      - ./certs:/certs:ro
+      - ./conf:/conf:ro
+    environment:
+      - PYKMIP_CONFIG=/conf/server.conf
+    command: ["pykmip-server", "-f", "/conf/server.conf", "-l", "/dev/stderr"]
