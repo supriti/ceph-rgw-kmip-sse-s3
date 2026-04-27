@@ -1,0 +1,8 @@
+; SSE-S3 via KMIP backend (PyKMIP container)
+rgw crypt sse s3 backend = kmip
+rgw crypt kmip addr = host.docker.internal:5696
+rgw crypt kmip ca path = /workspaces/ceph/docker/certs/ca.crt
+rgw crypt kmip client cert = /workspaces/ceph/docker/certs/client.crt
+rgw crypt kmip client key = /workspaces/ceph/docker/certs/client.key
+rgw crypt kmip socket io timeout sec = 30
+rgw crypt kmip worker threads = 32
