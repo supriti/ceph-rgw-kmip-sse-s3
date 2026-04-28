@@ -116,16 +116,12 @@ Modified files:
 
 ### 4. Testing
 
--   No support for unit tests
--  TODO: refer to scripts that you wrote 
-- also teuthoology 
+- Teuthology
 
 ### 5. Open Items
 
--   Additional s3-tests may be needed for KMIP-specific edge cases: WIP by kyr 
--   DEK caching in RGW memory (with TTL) could reduce KMIP round-trips for repeated GETs — follow-up optimization
--   Connection health checks for stale pooled connections — follow-up improvement
-
+-   Additional s3-tests may be needed for KMIP-specific edge cases. 
+-   DEK caching in RGW memory (with TTL) could reduce KMIP round-trips for repeated GETs - follow up optimizations.
 
 ## Code Architecture
 
