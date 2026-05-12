@@ -82,7 +82,7 @@ radosgw-admin user create --uid=kmiptest --display-name="KMIP Test" \
 
 ```
 
-Run the suite:
+### Run the suite:
 
 ```bash
 python3 tests/test_sse.py
@@ -120,3 +120,5 @@ warp mixed \
 ```
 
 To confirm KMIP is actually being exercised, watch the RGW log for `KMIP encrypt succeeded` / `Successfully unwrapped DEK` lines.
+
+NOTE: PyKMIP is not a production KMIP server, it has restrictions and will not give good performance numbers. 

@@ -420,6 +420,233 @@ def test_sse_s3_multipart():
         cleanup_bucket(bucket)
 
 
+def test_sse_s3_bucket_recreate():
+    """Delete a bucket that has SSE-S3 KEK, recreate with same name, verify
+    new objects encrypt+decrypt cleanly (no KEK collision)."""
+    name = "test-sse-s3-bucket-recreate"
+    bucket = "sse-s3-recreate"
+    try:
+        # First lifecycle: create + put + delete
+        get_or_create_bucket(bucket)
+        s3.put_object(Bucket=bucket, Key='obj1', Body=b'first',
+                      ServerSideEncryption='AES256')
+        cleanup_bucket(bucket)
+
+        # Recreate with the same name and put a new object
+        get_or_create_bucket(bucket)
+        data = os.urandom(1024)
+        s3.put_object(Bucket=bucket, Key='obj1', Body=data,
+                      ServerSideEncryption='AES256')
+
+        # The new object must round-trip — old KEK should not interfere
+        resp = s3.get_object(Bucket=bucket, Key='obj1')
+        body = resp['Body'].read()
+        result(name, body == data,
+               f"recreated bucket round-trip failed: got {len(body)} bytes")
+    except ClientError as e:
+        result(name, False, f"ClientError: {e.response['Error']}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(bucket)
+
+
+def test_sse_s3_copy_object_rejected():
+    """RGW currently rejects CopyObject on encrypted source objects (501).
+    This test pins that behavior. See rgw_rados.cc:copy_obj — long-standing
+    limitation; not specific to the KMIP backend."""
+    name = "test-sse-s3-copy-object-rejected"
+    src_bucket = get_or_create_bucket("sse-s3-copy-src")
+    dst_bucket = get_or_create_bucket("sse-s3-copy-dst")
+    try:
+        s3.put_object(Bucket=src_bucket, Key='source-obj', Body=b'data',
+                      ServerSideEncryption='AES256')
+        try:
+            s3.copy_object(
+                Bucket=dst_bucket, Key='copied-obj',
+                CopySource={'Bucket': src_bucket, 'Key': 'source-obj'},
+                ServerSideEncryption='AES256',
+            )
+            result(name, False, "Expected 501 NotImplemented but copy succeeded")
+        except ClientError as e:
+            status = e.response['ResponseMetadata']['HTTPStatusCode']
+            code = e.response['Error'].get('Code', '')
+            ok = (status == 501) and (code == 'NotImplemented')
+            result(name, ok, f"status={status}, code={code}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(src_bucket)
+        cleanup_bucket(dst_bucket)
+
+def test_sse_s3_bucket_default_encryption():
+    """Set a bucket's default encryption to AES256, then PUT without an
+    explicit SSE header. The object should be encrypted automatically and
+    HEAD should report AES256."""
+    name = "test-sse-s3-bucket-default-encryption"
+    bucket = get_or_create_bucket("sse-s3-default-enc")
+    try:
+        s3.put_bucket_encryption(
+            Bucket=bucket,
+            ServerSideEncryptionConfiguration={
+                'Rules': [{
+                    'ApplyServerSideEncryptionByDefault': {
+                        'SSEAlgorithm': 'AES256'
+                    }
+                }]
+            }
+        )
+
+        data = b'inherits encryption from bucket default'
+        # No ServerSideEncryption arg — should be inferred from bucket default
+        s3.put_object(Bucket=bucket, Key='inherit-obj', Body=data)
+
+        head = s3.head_object(Bucket=bucket, Key='inherit-obj')
+        sse = head.get('ServerSideEncryption', '')
+
+        body = s3.get_object(Bucket=bucket, Key='inherit-obj')['Body'].read()
+
+        ok = (sse == 'AES256') and (body == data)
+        result(name, ok, f"SSE={sse}, data_match={body == data}")
+    except ClientError as e:
+        result(name, False, f"ClientError: {e.response['Error']}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(bucket)
+
+
+def test_sse_s3_multipart_many_parts():
+    """SSE-S3 multipart upload with 8 parts (5 MiB each = 40 MiB).
+    Catches per-part DEK derivation bugs that 2-part tests can miss."""
+    name = "test-sse-s3-multipart-many-parts"
+    bucket = get_or_create_bucket("sse-s3-multi-many")
+    try:
+        key = "multipart-8parts"
+        part_size = 5 * 1024 * 1024
+        num_parts = 8
+        total_size = part_size * num_parts
+        data = os.urandom(total_size)
+
+        mpu = s3.create_multipart_upload(
+            Bucket=bucket, Key=key, ServerSideEncryption='AES256'
+        )
+        upload_id = mpu['UploadId']
+        parts = []
+        for i in range(num_parts):
+            offset = i * part_size
+            part_num = i + 1
+            resp = s3.upload_part(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+                PartNumber=part_num,
+                Body=data[offset:offset + part_size],
+            )
+            parts.append({'PartNumber': part_num, 'ETag': resp['ETag']})
+
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+
+        body = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+        result(name, body == data,
+               f"size mismatch: expected {total_size}, got {len(body)}")
+    except ClientError as e:
+        result(name, False, f"ClientError: {e.response['Error']}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(bucket)
+
+
+def test_sse_s3_multipart_range_get():
+    """Range-GET on a multipart-uploaded SSE-S3 object across part boundaries.
+    Verifies decrypt is correct when ranges span multiple multipart parts."""
+    name = "test-sse-s3-multipart-range-get"
+    bucket = get_or_create_bucket("sse-s3-multi-range")
+    try:
+        key = "multipart-range"
+        part_size = 5 * 1024 * 1024
+        num_parts = 3
+        total_size = part_size * num_parts
+        data = os.urandom(total_size)
+
+        mpu = s3.create_multipart_upload(
+            Bucket=bucket, Key=key, ServerSideEncryption='AES256'
+        )
+        upload_id = mpu['UploadId']
+        parts = []
+        for i in range(num_parts):
+            offset = i * part_size
+            resp = s3.upload_part(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+                PartNumber=i + 1,
+                Body=data[offset:offset + part_size],
+            )
+            parts.append({'PartNumber': i + 1, 'ETag': resp['ETag']})
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+
+        # Three ranges chosen to exercise distinct cases:
+        #   - within the first part (no part boundary crossed)
+        #   - across part boundary 1 -> 2
+        #   - across part boundary 2 -> 3 (asymmetric)
+        cases = [
+            (1024, 2048),
+            (part_size - 100, part_size + 100),
+            (2 * part_size - 1000, 2 * part_size + 1000),
+        ]
+        all_ok = True
+        details = []
+        for start, end in cases:
+            expected = data[start:end + 1]
+            resp = s3.get_object(
+                Bucket=bucket, Key=key, Range=f'bytes={start}-{end}'
+            )
+            got = resp['Body'].read()
+            ok = got == expected
+            all_ok = all_ok and ok
+            details.append(f"{start}-{end}:{ 'ok' if ok else 'BAD' }")
+
+        result(name, all_ok, ', '.join(details))
+    except ClientError as e:
+        result(name, False, f"ClientError: {e.response['Error']}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(bucket)
+
+
+def test_sse_s3_with_tagging():
+    """Combine SSE-S3 with object tagging on PUT. Both must persist —
+    tags should be retrievable and the object must round-trip."""
+    name = "test-sse-s3-with-tagging"
+    bucket = get_or_create_bucket("sse-s3-tagged")
+    try:
+        data = os.urandom(2048)
+        # Tagging passed as URL-encoded string in PUT
+        s3.put_object(
+            Bucket=bucket, Key='tagged-obj', Body=data,
+            ServerSideEncryption='AES256',
+            Tagging='env=dev&owner=qa',
+        )
+
+        body = s3.get_object(Bucket=bucket, Key='tagged-obj')['Body'].read()
+        tags_resp = s3.get_object_tagging(Bucket=bucket, Key='tagged-obj')
+        tags = {t['Key']: t['Value'] for t in tags_resp.get('TagSet', [])}
+
+        ok = (body == data) and tags.get('env') == 'dev' and tags.get('owner') == 'qa'
+        result(name, ok, f"data_match={body == data}, tags={tags}")
+    except ClientError as e:
+        result(name, False, f"ClientError: {e.response['Error']}")
+    except Exception as e:
+        result(name, False, str(e))
+    finally:
+        cleanup_bucket(bucket)
+
+
 # ============ Conflict / Error Tests ============
 
 def test_conflict_sse_c_and_kms():
@@ -617,6 +844,12 @@ if __name__ == '__main__':
     test_sse_s3_data_integrity()
     test_sse_s3_overwrite_integrity()
     test_sse_s3_multipart()
+    test_sse_s3_bucket_recreate()
+    test_sse_s3_copy_object_rejected()
+    test_sse_s3_bucket_default_encryption()
+    test_sse_s3_multipart_many_parts()
+    test_sse_s3_multipart_range_get()
+    test_sse_s3_with_tagging()
 
     # print("\n--- SSE-C Tests ---")
     # test_sse_c_put_get()
@@ -633,3 +866,4 @@ if __name__ == '__main__':
     print("=" * 60)
 
     sys.exit(1 if FAIL > 0 else 0)
+

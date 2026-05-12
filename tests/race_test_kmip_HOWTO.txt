@@ -1,0 +1,17 @@
+# 1. Set KMIP workers to >1 so concurrency is real (not serialized at queue)
+./bin/ceph config set client.rgw.8000 rgw_crypt_kmip_worker_threads 4
+
+# 2. Restart rgw to pick up new worker count (read once at startup)
+kill <radosgw-pid>
+./bin/radosgw -c /workspaces/ceph/build/ceph.conf ... -n client.rgw.8000 ...
+
+# 3. Confirm 4 workers started
+grep "kmip_worker\[" build/out/radosgw.8000.log | tail -5
+#   kmip_worker[0] start
+#   kmip_worker[1] start
+#   kmip_worker[2] start
+#   kmip_worker[3] start
+
+# 4. Run the race test
+python3 race_test_kmip.py
+
