@@ -451,28 +451,35 @@ def test_sse_s3_bucket_recreate():
         cleanup_bucket(bucket)
 
 
-def test_sse_s3_copy_object_rejected():
-    """RGW currently rejects CopyObject on encrypted source objects (501).
-    This test pins that behavior. See rgw_rados.cc:copy_obj — long-standing
-    limitation; not specific to the KMIP backend."""
-    name = "test-sse-s3-copy-object-rejected"
+def test_sse_s3_copy_object():
+    """CopyObject of an SSE-S3 object into another bucket with SSE-S3.
+    Supported since Ceph v20.2.3 (earlier releases returned 501).
+    Verifies the copy is encrypted and its data matches the source."""
+    name = "test-sse-s3-copy-object"
     src_bucket = get_or_create_bucket("sse-s3-copy-src")
     dst_bucket = get_or_create_bucket("sse-s3-copy-dst")
     try:
-        s3.put_object(Bucket=src_bucket, Key='source-obj', Body=b'data',
+        # spans several 4 KiB encryption blocks plus a partial block
+        data = os.urandom(3 * 4096 + 123)
+        s3.put_object(Bucket=src_bucket, Key='source-obj', Body=data,
                       ServerSideEncryption='AES256')
-        try:
-            s3.copy_object(
-                Bucket=dst_bucket, Key='copied-obj',
-                CopySource={'Bucket': src_bucket, 'Key': 'source-obj'},
-                ServerSideEncryption='AES256',
-            )
-            result(name, False, "Expected 501 NotImplemented but copy succeeded")
-        except ClientError as e:
-            status = e.response['ResponseMetadata']['HTTPStatusCode']
-            code = e.response['Error'].get('Code', '')
-            ok = (status == 501) and (code == 'NotImplemented')
-            result(name, ok, f"status={status}, code={code}")
+        s3.copy_object(
+            Bucket=dst_bucket, Key='copied-obj',
+            CopySource={'Bucket': src_bucket, 'Key': 'source-obj'},
+            ServerSideEncryption='AES256',
+        )
+        head = s3.head_object(Bucket=dst_bucket, Key='copied-obj')
+        sse = head.get('ServerSideEncryption', '')
+        resp = s3.get_object(Bucket=dst_bucket, Key='copied-obj')
+        body = resp['Body'].read()
+        src_sha = hashlib.sha256(data).hexdigest()
+        dst_sha = hashlib.sha256(body).hexdigest()
+        ok = (sse == 'AES256') and (src_sha == dst_sha)
+        result(name, ok,
+               f"SSE={sse}, size={len(body)}/{len(data)}, sha256 match={src_sha == dst_sha}")
+    except ClientError as e:
+        err = e.response['Error']
+        result(name, False, f"ClientError: {err}")
     except Exception as e:
         result(name, False, str(e))
     finally:
@@ -845,7 +852,7 @@ if __name__ == '__main__':
     test_sse_s3_overwrite_integrity()
     test_sse_s3_multipart()
     test_sse_s3_bucket_recreate()
-    test_sse_s3_copy_object_rejected()
+    test_sse_s3_copy_object()
     test_sse_s3_bucket_default_encryption()
     test_sse_s3_multipart_many_parts()
     test_sse_s3_multipart_range_get()
